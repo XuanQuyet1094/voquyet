@@ -1,0 +1,11 @@
+# Never commit runtime account data or credentials.
+.env
+.env.*
+!.env.example
+config.json
+accounts.json
+sessions/
+diagnostics/
+rewards-result.json
+*.log
+node_modules/
