@@ -1,0 +1,32 @@
+name: App reading verification
+on:
+  workflow_dispatch:
+env:
+  REWARDS_GROUP_LABEL: group2
+
+permissions:
+  contents: read
+concurrency:
+  group: rewards-accounts-1-6
+  cancel-in-progress: false
+jobs:
+  plan:
+    if: ${{ vars.REWARDS_GROUP2_ENABLED == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    outputs:
+      date: ${{ steps.plan.outputs.date }}
+    steps:
+      - id: plan
+        run: echo "date=$(TZ=Asia/Ho_Chi_Minh date +%F)" >> "$GITHUB_OUTPUT"
+  verify:
+    if: ${{ vars.REWARDS_GROUP2_ENABLED == 'true' }}
+    needs: plan
+    uses: ./.github/workflows/rewards-account.yml
+    with:
+      account: 3
+      run_mode: app-read-test
+      run_date: ${{ needs.plan.outputs.date }}
+    secrets: inherit
+
+# Owner-authorized account 3 reading-only experiment; private receipts limit the daily credit budget.

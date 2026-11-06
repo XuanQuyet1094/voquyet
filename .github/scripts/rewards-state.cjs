@@ -1,0 +1,391 @@
+'use strict';
+const fs = require('node:fs');
+const path = require('node:path');
+const taskStatus = require('./rewards-tasks.cjs');
+const searchLedger = require('./rewards-search-ledger.cjs');
+function privateRepository() {
+  const value = process.env.REWARDS_PRIVATE_REPO || '';
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(value)) {
+    throw new Error('Missing or invalid REWARDS_PRIVATE_REPO');
+  }
+  return value;
+}
+const BRANCH = 'rewards-state';
+const today = () => new Date(Date.now() + 7 * 3600000).toISOString().slice(0, 10);
+const transient = new Set(['LOGIN_TRANSIENT_ERROR', 'NETWORK_TIMEOUT', 'ACCOUNT_TIMEOUT', 'HTTP_408', 'HTTP_425', 'HTTP_429', 'HTTP_500', 'HTTP_502', 'HTTP_503', 'HTTP_504']);
+const network = new Set(['ERR_EMPTY_RESPONSE', 'ERR_PROXY_CONNECTION_FAILED', 'ERR_SOCKS_CONNECTION_FAILED', 'ERR_TUNNEL_CONNECTION_FAILED', 'ERR_NAME_NOT_RESOLVED', 'ERR_CONNECTION_RESET']);
+const blocked = new Set(['DAILY_WINDOW_EXPIRED', 'AUTH_REQUIRED', 'AUTH_METHOD_UNAVAILABLE', 'RECOVERY_EMAIL_REQUIRED', 'ACCOUNT_LOCKED', 'BOT_WARNING', 'PASSWORD_NOT_CONFIGURED', 'MICROSOFT_LOGIN_ERROR', 'MICROSOFT_LOGIN_UNKNOWN_ERROR',
+  'TOTP_METHOD_SELECTION_FAILED', 'TOTP_SECRET_INVALID', 'TOTP_SECRET_MISSING',
+  'TOTP_REJECTED', 'TOTP_INPUT_MISSING', 'TOTP_SUBMIT_FAILED', 'TOTP_NOT_ADVANCED']);
+const diagnosticErrors = new Set([...network, ...blocked, 'TRANSIENT_LOGIN_ALERT',
+  'BROWSER_EXECUTABLE_MISSING', 'BROWSER_LIBRARY_MISSING', 'DISPLAY_MISSING',
+  'BROWSER_OR_CONTEXT_CLOSED', 'TIMEOUT', 'LOGIN_TRANSIENT_ERROR', 'CHROMEWEBDATA_ERROR', 'UNCLASSIFIED_ERROR', 'TOTP_NOT_OFFERED']);
+const diagnosticStages = new Set(['STARTING', 'BROWSER', 'SESSION', 'LOGIN',
+  'LOGIN-TOTP', 'LOGIN-ENTER-EMAIL', 'LOGIN-ENTER-PASSWORD', 'DAILY-SET', 'READ-TO-EARN',
+  'SEARCH-MANAGER', 'SEARCH-BING']);
+const diagnosticLoginStates = new Set(['EMAIL_INPUT', 'FOOTER_ACTION', 'PASSWORD_INPUT',
+  'KMSI_PROMPT', 'ERROR_ALERT', 'EMAIL_VERIFICATION_INPUT', 'RECOVERY_EMAIL_INPUT',
+  'SIGN_IN_METHOD_PICKER', '2FA_TOTP', 'LOGIN_PASSWORDLESS', 'PASSWORDLESS_SEND_CODE',
+  'OTP_CODE_ENTRY', 'PASSKEY_ERROR', 'PASSKEY_VIDEO', 'ACCOUNT_LOCKED', 'LOGGED_IN',
+  'UNKNOWN', 'CHROMEWEBDATA_ERROR']);
+function safeDiagnostic(value) {
+  // Persist only fixed labels. Never include raw text, URLs, account identity or tokens.
+  const stage = diagnosticStages.has(value?.stage) ? value.stage : null;
+  const loginState = diagnosticLoginStates.has(value?.loginState) ? value.loginState : null;
+  const errors = [...new Set((Array.isArray(value?.errors) ? value.errors : [])
+    .filter(label => diagnosticErrors.has(label)))];
+  return stage || loginState || errors.length ? {stage, loginState, errors} : null;
+}
+function retryable(r) {
+  if (!r || r.status !== 'failed') return false;
+  const labels = [r.errorCode, ...(r.diagnostic?.errors || [])];
+  if (labels.some(x => blocked.has(x))) return false;
+  return transient.has(r.errorCode) || labels.some(x => network.has(x));
+}
+const DAILY_POINTS_TARGET = 220;
+function needsPointsReview(points) {
+  return !Number.isSafeInteger(points) || points < DAILY_POINTS_TARGET;
+}
+function hasBlockedAttempt(state) {
+  return Object.values(state || {}).some(entry => entry && typeof entry === 'object' &&
+    (entry.status === 'running' || [entry.errorCode, ...(entry.diagnostic?.errors || [])].some(label => blocked.has(label))));
+}
+function dailyTaskReview(state) {
+  const entries=Object.entries(state||{}).filter(([mode,e])=>['morning','retry','reconcile','test','app-test','app-read-test'].includes(mode)&&e&&e.status!=='running')
+    .map(([mode,e])=>({mode,e})).sort((a,b)=>String(a.e.finishedAt||'').localeCompare(String(b.e.finishedAt||'')));
+  let value=taskStatus.tasks();
+  for(const {e} of entries) {
+    value=taskStatus.merge(value,e.tasks);
+    if(e.searchEvidence)value=require('./rewards-search-evidence.cjs').applyTasks(value,e.searchEvidence);
+  }
+  return {tasks:value,...taskStatus.completion(value)};
+}
+function eligible(state, date, slot) {
+  return Boolean(state && state.schema === 1 && state.date === date && state.accountId === slot &&
+    !hasBlockedAttempt(state) && !state.retry &&
+    ((state.morning?.status === 'failed' && state.morning.retryable === true) ||
+     (state.morning?.status === 'completed' && ['incomplete','unverified'].includes(dailyTaskReview(state).status))));
+}
+async function dailySearchReview(state,ctx) {
+  return searchLedger.review(state,ctx,async entry=>{
+    const file=await api('/contents/reports/'+ctx.date+'/run-'+entry.runId+'-attempt-'+entry.runAttempt+'/account-'+ctx.slot+'.json?ref='+BRANCH,{},true);
+    return file ? JSON.parse(Buffer.from(file.content,'base64').toString('utf8')) : null;
+  },async entry=>{
+    const location='logs/'+ctx.date+'/account-'+ctx.slot+'-run-'+entry.runId+'-attempt-'+entry.runAttempt+'.log';
+    const file=await api('/contents/'+location+'?ref='+BRANCH,{},true);
+    return file ? Buffer.from(file.content,'base64').toString('utf8') : '';
+  });
+}
+async function dailyPointsReview(state, ctx) {
+  // Read immutable, same-day private receipts. Never count an attempt twice.
+  let total = 0, known = true, count = 0;
+  const seen = new Set();
+  for (const mode of ['morning', 'retry', 'reconcile', 'test', 'app-test', 'app-read-test']) {
+    const current = state[mode];
+    for (const entry of [...(current?.history || []), ...(current ? [current] : [])]) {
+      if (!entry.finishedAt || !/^\d+$/.test(entry.runId || '') || !/^\d+$/.test(entry.runAttempt || '')) continue;
+      const key = entry.runId + '/' + entry.runAttempt;
+      if (seen.has(key)) continue;
+      seen.add(key); count++;
+      const file = await api('/contents/reports/' + ctx.date + '/run-' + entry.runId + '-attempt-' + entry.runAttempt + '/account-' + ctx.slot + '.json?ref=' + BRANCH, {}, true);
+      const report = file ? JSON.parse(Buffer.from(file.content, 'base64').toString('utf8')) : null;
+      if (!report || report.date !== ctx.date || report.accountId !== ctx.slot ||
+          !Number.isSafeInteger(report.pointsEarned) || !Number.isSafeInteger(report.initialBalance) ||
+          !Number.isSafeInteger(report.finalBalance) || report.initialBalance < 0 || report.finalBalance < 0 ||
+          report.finalBalance - report.initialBalance !== report.pointsEarned) { known = false; continue; }
+      total += report.pointsEarned;
+    }
+  }
+  const pointsEarned = known && count && Number.isSafeInteger(total) ? total : null;
+  return {target: DAILY_POINTS_TARGET, pointsEarned, needsReview: needsPointsReview(pointsEarned)};
+}
+function stateResult(r) {
+  const result = {status: ['completed', 'failed', 'needs_action'].includes(r.status) ? r.status : 'failed',
+    retryable: retryable(r), errorCode: typeof r.errorCode === 'string' && /^[A-Z_0-9]{1,50}$/.test(r.errorCode) ? r.errorCode : null};
+  const diagnostic = safeDiagnostic(r.diagnostic);
+  if (diagnostic) result.diagnostic = diagnostic;
+  return result;
+}
+async function api(route, options = {}, allow404 = false) {
+  const response = await fetch(`https://api.github.com/repos/${privateRepository()}${route}`, {
+    ...options, headers: {Authorization: `Bearer ${process.env.REWARDS_STATE_TOKEN}`,
+      Accept: 'application/vnd.github+json', 'Content-Type': 'application/json',
+      'X-GitHub-Api-Version': '2022-11-28'}, signal: AbortSignal.timeout(20000)
+  });
+  if (allow404 && response.status === 404) return null;
+  if (!response.ok) throw new Error(`State API status ${response.status}`);
+  return response.json();
+}
+function context() {
+  const date = process.env.RUN_DATE;
+  const slot = Number(process.env.ACCOUNT_SLOT);
+  const mode = process.env.RUN_MODE;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date || '') || ![1,2,3,4,5,6].includes(slot) || !['morning','retry','reconcile','diagnostic','test','app-test','app-auth-probe','app-read-test'].includes(mode)) throw new Error('Invalid state context');
+  return {date, slot, mode, file: `/contents/state/${date}/account-${slot}.json`};
+}
+async function get(ctx) {
+  const repo = await api('');
+  if (repo.private !== true) throw new Error('State repository must be private');
+  await api(`/branches/${BRANCH}`); // A missing branch is a setup error, not missing daily state.
+  const file = await api(`${ctx.file}?ref=${BRANCH}`, {}, true);
+  if (!file) return {state: null, sha: undefined};
+  const state = JSON.parse(Buffer.from(file.content, 'base64').toString('utf8'));
+  if (state.schema !== 1 || state.date !== ctx.date || state.accountId !== ctx.slot) throw new Error('Invalid saved state');
+  return {state, sha: file.sha};
+}
+async function put(ctx, state, sha) {
+  await api(ctx.file, {method: 'PUT', body: JSON.stringify({branch: BRANCH, sha,
+    message: `Update ${ctx.date} account ${ctx.slot} ${ctx.mode} state`,
+    content: Buffer.from(JSON.stringify(state, null, 2) + '\n').toString('base64')})});
+}
+function output(key, value) { fs.appendFileSync(process.env.GITHUB_OUTPUT, `${key}=${value}\n`); }
+async function claim() {
+  const ctx = context();
+  if (ctx.date !== today()) { output('run', 'false'); console.log('Skipped: run date is no longer today in Vietnam.'); return; }
+  if (!require('./rewards-schedule.cjs').canStart(ctx.date, Date.now(), ctx.mode)) {
+    output('run', 'false'); console.log('Skipped: insufficient daily execution budget; no attempt reserved.'); return;
+  }
+  if (!process.env.REWARDS_STATE_TOKEN) {
+    if (ctx.mode === 'test') {
+      console.log('::warning::REWARDS_STATE_TOKEN missing: one-account test disabled to prevent duplicate runs.');
+      output('run', 'false');
+    } else if (ctx.mode === 'morning') {
+      console.log('::warning::REWARDS_STATE_TOKEN missing: morning run continues without saved retry state.');
+      output('run', 'true'); output('stored', 'false');
+    } else {
+      console.log('::warning::REWARDS_STATE_TOKEN missing: afternoon retry disabled.');
+      output('run', 'false');
+    }
+    return;
+  }
+  const {state: old, sha} = await get(ctx);
+  const state = old || {schema: 1, date: ctx.date, accountId: ctx.slot};
+  const selection = await require('./rewards-login-review.cjs').selectionView(state, ctx, async entry => {
+    const file = await api(`/contents/logs/${ctx.date}/account-${ctx.slot}-run-${entry.runId}-attempt-${entry.runAttempt}.log?ref=${BRANCH}`, {}, true);
+    return file ? Buffer.from(file.content, 'base64').toString('utf8') : '';
+  });
+  if (['retry', 'reconcile'].includes(ctx.mode)) {
+    state.dailyReview = await dailyPointsReview(state, ctx);
+  }
+  if (['morning','retry','reconcile'].includes(ctx.mode) && !state[ctx.mode] && !hasBlockedAttempt(selection))
+    state.searchReview = await dailySearchReview(state,ctx);
+  if (ctx.mode === 'reconcile' && (state.reconcile || Object.values(selection).some(entry =>
+      entry && typeof entry === 'object' && (entry.status === 'running' ||
+      [entry.errorCode, ...(entry.diagnostic?.errors || [])].some(label => blocked.has(label)))))) {
+    output('run', 'false'); console.log('Skipped: an attempt is active, blocked, or already reserved.'); return;
+  }
+  const probe = state['app-auth-probe'];
+  const appReadObserved = probe?.authVerified === true || (probe?.history || []).some(entry => entry.authVerified === true);
+  if ((ctx.mode === 'app-auth-probe' && (ctx.slot !== 1 || (state['app-auth-probe'] &&
+        (state['app-auth-probe'].status === 'running' || state['app-test']?.checkInVerified === true ||
+         (state['app-auth-probe'].history || []).length >= 5)))) ||
+      (ctx.mode === 'retry' && !eligible(selection, ctx.date, ctx.slot)) ||
+      (ctx.mode === 'morning' && state.morning) ||
+      (ctx.mode === 'test' && (ctx.slot !== 1 || state.test)) ||
+      (ctx.mode === 'app-read-test' && (![1,3].includes(ctx.slot) || (state['app-read-test'] &&
+        (state['app-read-test'].status === 'running' || state['app-read-test'].errorCode !== 'HTTP_401' ||
+         (state['app-read-test'].history || []).length >= 4)))) ||
+      (ctx.mode === 'app-test' && (ctx.slot !== 1 || (state['app-test'] &&
+        (state['app-test'].status === 'running' || state['app-test'].checkInVerified === true ||
+         ((state['app-test'].history || []).length >= (appReadObserved ? 8 : 2) && state['app-test'].errorCode !== 'SETUP_FAILED') ||
+         (state['app-test'].history || []).length >= (appReadObserved ? 9 : 3)))))) {
+    output('run', 'false'); console.log('Skipped: no eligible new attempt for this account today.'); return;
+  }
+  let readingPointsBudget;
+  if (['morning', 'retry', 'reconcile', 'app-read-test'].includes(ctx.mode)) {
+    let credited = 0;
+    let receiptsUnavailable = false;
+    const readingState = state['app-read-test'];
+    const entries = [...(readingState?.history || []), ...(readingState ? [readingState] : [])];
+    for (const entry of entries) {
+      if (!/^\d+$/.test(entry.runId || '') || !/^\d+$/.test(entry.runAttempt || '')) continue;
+      const file = await api('/contents/reports/' + ctx.date + '/run-' + entry.runId + '-attempt-' + entry.runAttempt + '/account-' + ctx.slot + '.json?ref=' + BRANCH, {}, true);
+      if (!file) {
+        if (ctx.mode === 'app-read-test') throw new Error('Reading receipts missing; cannot establish remaining credit budget');
+        receiptsUnavailable = true; break;
+      }
+      const report = JSON.parse(Buffer.from(file.content, 'base64').toString('utf8'));
+      if (report.date !== ctx.date || report.accountId !== ctx.slot || !Number.isSafeInteger(report.pointsEarned) ||
+          report.pointsEarned < 0 || report.pointsEarned > 30 || !Number.isSafeInteger(report.initialBalance) ||
+          !Number.isSafeInteger(report.finalBalance) || report.finalBalance - report.initialBalance !== report.pointsEarned)
+        { if (ctx.mode === 'app-read-test') throw new Error('Reading receipts unverified'); receiptsUnavailable = true; break; }
+      credited += report.pointsEarned;
+    }
+    // Ordinary runs can include other points. Only dedicated reading receipts count.
+    for (const mode of ['morning', 'retry', 'reconcile']) {
+      const entry = state[mode];
+      if (!entry || !/^\d+$/.test(entry.runId || '') || !/^\d+$/.test(entry.runAttempt || '')) continue;
+      const file = await api('/contents/reports/' + ctx.date + '/run-' + entry.runId + '-attempt-' + entry.runAttempt + '/account-' + ctx.slot + '.json?ref=' + BRANCH, {}, true);
+      if (!file) {receiptsUnavailable = true; break;}
+      const report = JSON.parse(Buffer.from(file.content, 'base64').toString('utf8'));
+      if (report.date !== ctx.date || report.accountId !== ctx.slot ||
+          !Number.isSafeInteger(report.readingPoints) || report.readingPoints < 0 || report.readingPoints > 30) {
+        receiptsUnavailable = true; break;
+      }
+      credited += report.readingPoints;
+    }
+    if (credited === 30) receiptsUnavailable = false;
+    else if (credited > 30) receiptsUnavailable = true;
+    readingPointsBudget = receiptsUnavailable ? 0 : Math.max(0, 30 - credited);
+    if (!readingPointsBudget && ctx.mode === 'app-read-test') { output('run', 'false'); console.log('Skipped: reading credit target already satisfied.'); return; }
+    const folder = path.join(process.env.RUNNER_TEMP || path.dirname(process.env.GITHUB_OUTPUT), 'rewards-private');
+    fs.mkdirSync(folder, {recursive: true, mode: 0o700});
+    fs.writeFileSync(path.join(folder, 'reading-budget.json'), JSON.stringify({date:ctx.date, accountId:ctx.slot, points:readingPointsBudget, verified:!receiptsUnavailable}), {mode:0o600});
+  }
+
+  if (['morning','retry','reconcile'].includes(ctx.mode)) {
+    const folder=path.join(process.env.RUNNER_TEMP || path.dirname(process.env.GITHUB_OUTPUT),'rewards-private');
+    fs.mkdirSync(folder,{recursive:true,mode:0o700});
+    fs.writeFileSync(path.join(folder,'search-budget.json'),JSON.stringify({schema:1,date:ctx.date,accountId:ctx.slot,
+      progress:searchLedger.progress(state.searchReview)}),{mode:0o600});
+  }
+  // Claim BEFORE the bot starts. Cancellation or re-running a job cannot reset the retry budget.
+  const history = ['app-test', 'app-auth-probe', 'app-read-test'].includes(ctx.mode) && state[ctx.mode]
+    ? [...(state[ctx.mode].history || []), {...state[ctx.mode], history: undefined}] : [];
+  state[ctx.mode] = {...(history.length ? {history} : {}), ...(readingPointsBudget ? {readingPointsBudget} : {}), status: 'running', retryable: false, errorCode: null,
+    runId: process.env.GITHUB_RUN_ID, runAttempt: process.env.GITHUB_RUN_ATTEMPT,
+    startedAt: new Date().toISOString()};
+  await put(ctx, state, sha); // SHA conflict fails closed instead of launching a duplicate.
+  output('stored', 'true'); output('run', 'true');
+}
+function privateLogLocation(ctx) {
+  const runId = process.env.GITHUB_RUN_ID;
+  const attempt = process.env.GITHUB_RUN_ATTEMPT;
+  if (!/^\d+$/.test(runId || '') || !/^\d+$/.test(attempt || '')) throw new Error('Invalid run reference');
+  const folder = ctx.mode === 'diagnostic' ? 'diagnostics' : 'logs';
+  return `${folder}/${ctx.date}/account-${ctx.slot}-run-${runId}-attempt-${attempt}.log`;
+}
+async function uploadPrivateLog(ctx, kind = 'bot') {
+  if (!process.env.REWARDS_STATE_TOKEN || !process.env.RUNNER_TEMP) return null;
+  const localPath = path.join(process.env.RUNNER_TEMP, 'rewards-private', `${kind === 'setup' ? 'setup-' : ''}account-${ctx.slot}.log`);
+  let content;
+  try { content = fs.readFileSync(localPath, 'utf8'); } catch { return null; }
+  // Keep GitHub Contents API payload well below its size limit.
+  const maxBytes = 900 * 1024;
+  if (Buffer.byteLength(content) > maxBytes) {
+    content = Buffer.from(content).subarray(-maxBytes).toString('utf8');
+    content = '[Earlier log lines omitted to fit the private storage limit.]\n' + content;
+  }
+  const location = kind === 'setup' ? privateLogLocation(ctx).replace(/^(logs|diagnostics)\//, 'setup-logs/') : privateLogLocation(ctx);
+  const route = `/contents/${location.split('/').map(encodeURIComponent).join('/')}?ref=${BRANCH}`;
+  const existing = await api(route, {}, true);
+  const body = {branch: BRANCH, message: `Save redacted ${ctx.date} account ${ctx.slot} ${ctx.mode} log`,
+    content: Buffer.from(content, 'utf8').toString('base64')};
+  if (existing?.sha) body.sha = existing.sha;
+  const putRoute = `/contents/${location.split('/').map(encodeURIComponent).join('/')}`;
+  await api(putRoute, {method: 'PUT', body: JSON.stringify(body)});
+  return location;
+}
+async function finish() {
+  if (process.env.STATE_STORED !== 'true') return;
+  const ctx = context();
+  const {state, sha} = await get(ctx);
+  const entry = state?.[ctx.mode];
+  if (!entry || entry.runId !== process.env.GITHUB_RUN_ID || entry.runAttempt !== process.env.GITHUB_RUN_ATTEMPT) throw new Error('Attempt ownership mismatch');
+  let result;
+  try { result = JSON.parse(fs.readFileSync(process.env.REPORT_PATH, 'utf8')); }
+  catch { result = {status: 'failed', errorCode: process.env.JOB_STATUS === 'cancelled' ? 'CANCELLED' : 'SETUP_FAILED'}; }
+  if (result.accountId !== undefined && Number(result.accountId) !== ctx.slot) throw new Error('Wrong account result');
+  let logPath = null, setupLogPath = null;
+  try { setupLogPath = await uploadPrivateLog(ctx, 'setup'); }
+  catch { console.warn('::warning::Private setup log upload failed; bot execution will not be repeated.'); }
+  try { logPath = await uploadPrivateLog(ctx); }
+  catch { console.error('Private bot log upload failed; private status will still be saved.'); }
+  try { await uploadPrivateLog(ctx, 'setup'); }
+  catch { console.error('Private setup log upload failed; status will still be saved.'); }
+  state[ctx.mode] = {...entry, ...stateResult(result), ...(ctx.mode === 'app-test' ? {checkInVerified: result.appCheckInVerified === true} : {}), ...(ctx.mode === 'app-auth-probe' ? {authVerified: result.appAuthVerified === true} : {}), ...(logPath ? {logPath} : {}), ...(setupLogPath ? {setupLogPath} : {}), finishedAt: new Date().toISOString()};
+  if (result.tasks) state[ctx.mode].tasks = taskStatus.tasks(result.tasks);
+  state[ctx.mode].requiredTasks=taskStatus.completion(result.tasks,result.requiredTasks).required;
+  state[ctx.mode].completion=taskStatus.completion(result.tasks,result.requiredTasks);
+  state[ctx.mode].timings=require('./rewards-performance.cjs').normalize(result.timings);
+  state[ctx.mode].quotaDiagnostics=(Array.isArray(result.quotaDiagnostics)?result.quotaDiagnostics:[]).map(require('./rewards-search-evidence.cjs').diagnostic).filter(Boolean).slice(-40);
+  state[ctx.mode].searchExecution=require('./rewards-search-evidence.cjs').execution(result.searchExecution);
+  if (result.searchPoints) state[ctx.mode].searchPoints=searchLedger.runPoints(result.searchPoints);
+  if (result.dailySearch) state[ctx.mode].dailySearch=searchLedger.progress(result.dailySearch);
+  if (result.searchEvidence) state[ctx.mode].searchEvidence=require('./rewards-search-evidence.cjs').normalize(result.searchEvidence);
+  await put(ctx, state, sha);
+  console.log(logPath ? 'Private result and redacted bot log saved to rewards-state.' : 'Private result saved; bot log was not available.');
+}
+
+function reportContext(env = process.env) {
+  if (!env.REWARDS_STATE_TOKEN) throw new Error('Private reporting requires state credentials');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(env.RUN_DATE || '') ||
+      !/^\d+$/.test(env.GITHUB_RUN_ID || '') || !/^\d+$/.test(env.GITHUB_RUN_ATTEMPT || '')) {
+    throw new Error('Invalid private report context');
+  }
+  return {date: env.RUN_DATE, runId: env.GITHUB_RUN_ID, attempt: env.GITHUB_RUN_ATTEMPT};
+}
+function reportRoute(ctx, slot) {
+  return `/contents/reports/${ctx.date}/run-${ctx.runId}-attempt-${ctx.attempt}/account-${slot}.json`;
+}
+function safeReport(value, slot, date) {
+  if (!value || value.accountId !== slot || value.date !== date ||
+      !['completed', 'failed', 'needs_action'].includes(value.status)) {
+    throw new Error('Invalid private report');
+  }
+  const metric = (v, nonnegative = false) => Number.isSafeInteger(v) && (!nonnegative || v >= 0) ? v : null;
+  return {accountId: slot, date, status: value.status,
+    nativeStatus: ['completed','partial','failed','skipped','cancelled'].includes(value.nativeStatus) ? value.nativeStatus : null,
+    appCheckIn: ['verified','auth_rejected','unverified','not_requested','unknown'].includes(value.appCheckIn) ? value.appCheckIn : 'unknown',
+    pointsEarned: metric(value.pointsEarned),
+    initialBalance: metric(value.initialBalance, true),
+    finalBalance: metric(value.finalBalance, true),
+    errorCode: typeof value.errorCode === 'string' && /^[A-Z_0-9]{1,50}$/.test(value.errorCode) ? value.errorCode : null,
+    tasks: taskStatus.tasks(value.tasks), requiredTasks:taskStatus.completion(value.tasks,value.requiredTasks).required,
+    completion:taskStatus.completion(value.tasks,value.requiredTasks),
+    timings:require('./rewards-performance.cjs').normalize(value.timings),
+    quotaDiagnostics:(Array.isArray(value.quotaDiagnostics)?value.quotaDiagnostics:[]).map(require('./rewards-search-evidence.cjs').diagnostic).filter(Boolean).slice(-40),
+    searchExecution:require('./rewards-search-evidence.cjs').execution(value.searchExecution),
+    readingPoints: metric(value.readingPoints,true),
+    ...(value.searchPoints ? {searchPoints:searchLedger.runPoints(value.searchPoints)} : {}),
+    ...(value.dailySearch ? {dailySearch:searchLedger.progress(value.dailySearch)} : {}),
+    ...(value.searchEvidence ? {searchEvidence:require('./rewards-search-evidence.cjs').normalize(value.searchEvidence)} : {})};
+}
+async function requirePrivateReports() {
+  if ((await api('')).private !== true) throw new Error('Reports repository must be private');
+  await api(`/branches/${BRANCH}`);
+}
+async function savePrivateReport(value) {
+  const ctx = reportContext();
+  const slot = Number(process.env.ACCOUNT_SLOT);
+  if (![1,2,3,4,5,6].includes(slot)) throw new Error('Invalid report slot');
+  const report = safeReport(value, slot, ctx.date);
+  await requirePrivateReports();
+  const route = reportRoute(ctx, slot);
+  const old = await api(`${route}?ref=${BRANCH}`, {}, true);
+  await api(route, {method:'PUT', body: JSON.stringify({branch: BRANCH, sha: old?.sha,
+    message: 'Save private run report',
+    content: Buffer.from(JSON.stringify(report)).toString('base64')})});
+}
+async function readPrivateReports(jobs) {
+  const ctx = reportContext();
+  await requirePrivateReports();
+  const result = {};
+  for (const slot of [1,2,3,4,5,6]) {
+    const job = jobs[`account_${slot}`] || {};
+    const file = await api(`${reportRoute(ctx, slot)}?ref=${BRANCH}`, {}, true);
+    const report = file ? safeReport(JSON.parse(Buffer.from(file.content,'base64').toString('utf8')), slot, ctx.date) : null;
+    result[`account_${slot}`] = {...job, outputs: {result: report ? JSON.stringify(report) : ''}};
+  }
+  return result;
+}
+
+module.exports = {DAILY_POINTS_TARGET, needsPointsReview, dailyPointsReview, dailySearchReview, dailyTaskReview, retryable, eligible, stateResult, claim, finish, savePrivateReport, readPrivateReports,
+  api, requirePrivateReports, reportContext, safeReport};
+if (require.main === module) {
+  const task = process.argv[2] === 'claim' ? claim :
+    process.argv[2] === 'finish' ? finish :
+    process.argv[2] === 'upload-log' ? async () => {
+      const ctx = context();
+      if (ctx.mode !== 'diagnostic') throw new Error('upload-log is only for diagnostic runs');
+      const location = await uploadPrivateLog(ctx);
+      const setup = await uploadPrivateLog(ctx, 'setup');
+      if (!location && !setup) throw new Error('Private diagnostic log was not available');
+      console.log('Private diagnostic/setup log saved.');
+    } : null;
+  if (!task) process.exitCode = 1;
+  else task().catch(() => {
+    console.error('State operation failed; bot will not be retried blindly. Check REWARDS_STATE_TOKEN (Contents: read/write on private repo) and rewards-state branch.');
+    process.exitCode = 1;
+  });
+}

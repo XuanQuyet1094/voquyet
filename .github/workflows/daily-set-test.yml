@@ -1,0 +1,33 @@
+name: Selected activity verification
+on:
+  workflow_dispatch:
+env:
+  REWARDS_GROUP_LABEL: group2
+
+permissions:
+  contents: read
+concurrency:
+  group: rewards-accounts-1-6
+  cancel-in-progress: false
+jobs:
+  plan:
+    if: ${{ vars.REWARDS_GROUP2_ENABLED == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      date: ${{ steps.date.outputs.date }}
+    steps:
+      - name: Select current Vietnam date
+        id: date
+        run: node -e "require('node:fs').appendFileSync(process.env.GITHUB_OUTPUT,'date='+new Date(Date.now()+7*3600000).toISOString().slice(0,10)+'\n')"
+  verify:
+    if: ${{ vars.REWARDS_GROUP2_ENABLED == 'true' }}
+    name: Verification
+    needs: plan
+    uses: ./.github/workflows/rewards-account.yml
+    with:
+      account: 1
+      run_mode: test
+      run_date: ${{ needs.plan.outputs.date }}
+      debug_daily_set: true
+    secrets: inherit
